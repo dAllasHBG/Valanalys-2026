@@ -27,6 +27,12 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+try:
+    from streamlit_sortables import sort_items
+    SORTABLES_AVAILABLE = True
+except ImportError:
+    SORTABLES_AVAILABLE = False
+
 st.set_page_config(page_title="Valanalys 2026", page_icon="🗳️", layout="wide")
 
 # --------------------------------------------------------------------------
@@ -74,9 +80,78 @@ def _novus_archive_url(d) -> str:
 NOVUS_LAST_UPDATED = f"{NOVUS_LAST_UPDATED_DATE.day} {_SWEDISH_MONTHS[NOVUS_LAST_UPDATED_DATE.month]} {NOVUS_LAST_UPDATED_DATE.year}"
 NOVUS_SOURCE_URL = _novus_archive_url(NOVUS_LAST_UPDATED_DATE)
 
+PARTY_FULL_NAMES = {
+    "M": "Moderaterna", "L": "Liberalerna", "C": "Centerpartiet", "KD": "Kristdemokraterna",
+    "S": "Socialdemokraterna", "V": "Vänsterpartiet", "MP": "Miljöpartiet", "SD": "Sverigedemokraterna",
+}
+
+# Några färdiga exempel att snabbstarta ifrån i fliken "Egna block". Fritt att
+# lägga till fler — nyckeln blir texten i väljaren.
+BLOCK_PRESETS = {
+    "Tidö vs Rödgröna (dagens blockindelning)": {
+        "a_name": "Tidöpartierna", "a_parties": ["M", "KD", "L", "SD"],
+        "b_name": "Rödgröna", "b_parties": ["S", "V", "MP"],
+    },
+    "Alliansen vs Övriga": {
+        "a_name": "Alliansen", "a_parties": ["M", "C", "L", "KD"],
+        "b_name": "Övriga", "b_parties": ["S", "V", "MP", "SD"],
+    },
+    "Storkoalition (M+S) vs Resten": {
+        "a_name": "Storkoalition (M+S)", "a_parties": ["M", "S"],
+        "b_name": "Resten", "b_parties": ["C", "L", "KD", "V", "MP", "SD"],
+    },
+    "Mittenblock vs Flyglarna": {
+        "a_name": "Mittenblock (C+L+KD+MP)", "a_parties": ["C", "L", "KD", "MP"],
+        "b_name": "Flyglarna (S+SD)", "b_parties": ["S", "SD"],
+    },
+    "Alla utom SD vs SD": {
+        "a_name": "Alla utom SD", "a_parties": ["M", "L", "C", "KD", "S", "V", "MP"],
+        "b_name": "SD", "b_parties": ["SD"],
+    },
+}
+
+CUSTOM_SORTABLE_CSS = """
+.sortable-component { border: none; }
+.sortable-container {
+    border-radius: 14px;
+    padding: 4px;
+    margin: 0 8px 8px 0;
+    min-height: 180px;
+}
+.sortable-container-header {
+    font-weight: 700;
+    font-size: 17px;
+    padding: 10px 14px;
+    border-radius: 10px 10px 0 0;
+}
+.sortable-container-body { padding: 10px; }
+.sortable-item {
+    font-size: 16px;
+    font-weight: 600;
+    padding: 12px 16px;
+    margin: 6px 0;
+    border-radius: 10px;
+    cursor: grab;
+}
+.sortable-container:nth-of-type(1) .sortable-container-header { background-color: #cfe2ff; }
+.sortable-container:nth-of-type(1) .sortable-item { background-color: #e7f1ff; border: 2px solid #6ea8fe; }
+.sortable-container:nth-of-type(2) .sortable-container-header { background-color: #ffe0c2; }
+.sortable-container:nth-of-type(2) .sortable-item { background-color: #fff1e6; border: 2px solid #fd7e14; }
+.sortable-container:nth-of-type(3) .sortable-container-header { background-color: #e9ecef; }
+.sortable-container:nth-of-type(3) .sortable-item { background-color: #f8f9fa; border: 2px dashed #adb5bd; color: #495057; }
+"""
+
 
 def party_color(p: str) -> str:
     return PARTY_COLORS.get(p, FALLBACK_COLOR)
+
+
+def chip_label(code: str) -> str:
+    return f"{code} — {PARTY_FULL_NAMES.get(code, code)}"
+
+
+def code_from_chip(label: str) -> str:
+    return label.split(" — ")[0]
 
 
 # --------------------------------------------------------------------------
@@ -455,32 +530,94 @@ with tab_custom:
     st.markdown(
         "**Bygg egna block.** Standardblocken (Tidö/Rödgröna) i fliken "
         "'Blocken' är låsta till dagens riksdagsuppställning — här kan du "
-        "istället testa vilka konstellationer som helst, t.ex. en tänkbar "
-        "framtida koalition eller ett block utan ett visst parti."
+        "istället testa vilka konstellationer som helst."
     )
 
     parties_selectable = [p for p in df_novus.index if p != "Annat"]
 
+    # --- Grundtillstånd (första gången fliken visas) --------------------
+    if "block_a_name" not in st.session_state:
+        st.session_state["block_a_name"] = "Tidöpartierna"
+    if "block_b_name" not in st.session_state:
+        st.session_state["block_b_name"] = "Rödgröna"
+    if "custom_block_state" not in st.session_state:
+        assigned0 = {"M", "KD", "L", "SD", "S", "V", "MP"}
+        st.session_state["custom_block_state"] = {
+            "a": ["M", "KD", "L", "SD"],
+            "b": ["S", "V", "MP"],
+            "unassigned": [p for p in parties_selectable if p not in assigned0],
+        }
+    if "applied_preset" not in st.session_state:
+        st.session_state["applied_preset"] = "Tidö vs Rödgröna (dagens blockindelning)"
+
+    def _apply_block_preset():
+        chosen = st.session_state["preset_selectbox"]
+        st.session_state["applied_preset"] = chosen
+        if chosen in BLOCK_PRESETS:
+            preset = BLOCK_PRESETS[chosen]
+            st.session_state["block_a_name"] = preset["a_name"]
+            st.session_state["block_b_name"] = preset["b_name"]
+            assigned = set(preset["a_parties"]) | set(preset["b_parties"])
+            st.session_state["custom_block_state"] = {
+                "a": list(preset["a_parties"]),
+                "b": list(preset["b_parties"]),
+                "unassigned": [p for p in parties_selectable if p not in assigned],
+            }
+
+    preset_options = ["🎨 Anpassat (mitt eget val)"] + list(BLOCK_PRESETS.keys())
+    st.selectbox(
+        "Snabbstart — välj ett färdigt exempel eller bygg helt eget",
+        preset_options,
+        index=preset_options.index(st.session_state["applied_preset"])
+        if st.session_state["applied_preset"] in preset_options else 0,
+        key="preset_selectbox",
+        on_change=_apply_block_preset,
+    )
+
     col_a, col_b = st.columns(2)
     with col_a:
-        block_a_name = st.text_input("Namn på block A", value="Block A", key="block_a_name")
-        block_a_parties = st.multiselect(
-            "Partier i block A", parties_selectable,
-            default=["M", "KD", "L", "SD"], key="block_a_parties",
-        )
+        block_a_name = st.text_input("Namn på block A", key="block_a_name")
     with col_b:
-        block_b_name = st.text_input("Namn på block B", value="Block B", key="block_b_name")
-        block_b_parties = st.multiselect(
-            "Partier i block B", parties_selectable,
-            default=["S", "V", "MP"], key="block_b_parties",
-        )
+        block_b_name = st.text_input("Namn på block B", key="block_b_name")
 
-    overlap = set(block_a_parties) & set(block_b_parties)
-    if overlap:
-        st.warning(
-            f"⚠️ {', '.join(sorted(overlap))} ingår i båda blocken — "
-            "totalerna nedan räknar då med partiet dubbelt."
+    state = st.session_state["custom_block_state"]
+
+    if SORTABLES_AVAILABLE:
+        st.caption("🖱️ Dra partierna mellan rutorna för att bygga dina egna block.")
+        container_items = [
+            {"header": f"🟦 {block_a_name} ({len(state['a'])})", "items": [chip_label(p) for p in state["a"]]},
+            {"header": f"🟧 {block_b_name} ({len(state['b'])})", "items": [chip_label(p) for p in state["b"]]},
+            {"header": f"⚪ Inte tilldelat ({len(state['unassigned'])})", "items": [chip_label(p) for p in state["unassigned"]]},
+        ]
+        sorted_result = sort_items(container_items, multi_containers=True, custom_style=CUSTOM_SORTABLE_CSS)
+        new_state = {
+            "a": [code_from_chip(x) for x in sorted_result[0]["items"]],
+            "b": [code_from_chip(x) for x in sorted_result[1]["items"]],
+            "unassigned": [code_from_chip(x) for x in sorted_result[2]["items"]],
+        }
+        st.session_state["custom_block_state"] = new_state
+        block_a_parties = new_state["a"]
+        block_b_parties = new_state["b"]
+    else:
+        st.info(
+            "💡 Installera `streamlit-sortables` (finns i requirements.txt) för att "
+            "kunna dra-och-släppa partier mellan blocken. Använder vanliga "
+            "väljare tills vidare."
         )
+        with st.container(border=True):
+            block_a_parties = st.multiselect(
+                f"Partier i {block_a_name}", parties_selectable, default=state["a"], key="block_a_multiselect",
+            )
+        with st.container(border=True):
+            block_b_parties = st.multiselect(
+                f"Partier i {block_b_name}", parties_selectable, default=state["b"], key="block_b_multiselect",
+            )
+        overlap = set(block_a_parties) & set(block_b_parties)
+        if overlap:
+            st.warning(
+                f"⚠️ {', '.join(sorted(overlap))} ingår i båda blocken — "
+                "totalerna nedan räknar då med partiet dubbelt."
+            )
 
     latest_col_cb = timeline_cols[-1]
     a_pct = df_novus.loc[block_a_parties, latest_col_cb].sum() if block_a_parties else 0.0
@@ -508,7 +645,7 @@ with tab_custom:
         )
         st.plotly_chart(fig_custom, width='stretch')
     else:
-        st.info("Välj minst ett parti i något av blocken ovan för att se en tidslinje.")
+        st.info("Lägg minst ett parti i något av blocken ovan för att se en tidslinje.")
 
     st.markdown("---")
     st.subheader("Uppskattat mandatstöd för blocken")
