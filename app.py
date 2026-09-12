@@ -16,8 +16,9 @@ VIKTIGT innan du publicerar/kör den här på valnatten:
 """
 
 import io
+import re
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 from urllib.parse import quote
 
 import numpy as np
@@ -26,6 +27,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
 
 try:
     from streamlit_sortables import sort_items
@@ -80,6 +87,144 @@ def _novus_archive_url(d) -> str:
 NOVUS_LAST_UPDATED = f"{NOVUS_LAST_UPDATED_DATE.day} {_SWEDISH_MONTHS[NOVUS_LAST_UPDATED_DATE.month]} {NOVUS_LAST_UPDATED_DATE.year}"
 NOVUS_SOURCE_URL = _novus_archive_url(NOVUS_LAST_UPDATED_DATE)
 
+# --------------------------------------------------------------------------
+# Automatisk hämtning av nya Novus-mätningar från Wikipedia
+#
+# Novus egen webbplats presenterar bara den fullständiga partifördelningen
+# som en bild (diagram), inte som text/HTML — den går alltså inte att läsa
+# av automatiskt på ett pålitligt sätt. Wikipedia håller däremot en löpande,
+# community-underhållen sammanställning av ALLA pollningsföretags mätningar
+# (inklusive Novus) i en vanlig HTML-tabell, licensierad CC BY-SA (fri att
+# återanvända med attribution). Vi filtrerar ut bara Novus-raderna därifrån
+# för att matcha resten av appen.
+#
+# Det här är "best effort": Wikipedia-sidan kan ändra struktur, sakna en
+# mätning tillfälligt, eller innehålla enstaka inmatningsfel från de som
+# redigerar artikeln. Misslyckas hämtningen visas ett tydligt felmeddelande
+# och appen faller tillbaka på den inkodade datan — den kraschar aldrig.
+# --------------------------------------------------------------------------
+
+WIKI_POLLS_URL = "https://en.wikipedia.org/wiki/Opinion_polling_for_the_2026_Swedish_general_election"
+
+_EN_MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+
+def _parse_wiki_fieldwork_end_date(text: str):
+    """Tolkar Wikipedias datumintervall (t.ex. '24–30 Aug' eller
+    '20 Aug–2 Sep 2026') och returnerar ett date-objekt för SISTA dagen i
+    intervallet, eller None om texten inte gick att tolka."""
+    if not text:
+        return None
+    cleaned = text.replace("\u2013", "-").replace("\u2012", "-").strip()
+    end_part = cleaned.split("-")[-1].strip()
+    m = re.search(r"(\d{1,2})\s+([A-Za-z]+)\.?\s*(\d{4})?", end_part)
+    if not m:
+        return None
+    day = int(m.group(1))
+    month = _EN_MONTHS.get(m.group(2).lower())
+    if month is None:
+        return None
+    year = int(m.group(3)) if m.group(3) else NOVUS_LAST_UPDATED_DATE.year
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def fetch_novus_updates_from_wikipedia():
+    """
+    Hämtar Novus-mätningar från Wikipedias sammanställning av opinionsmätningar
+    inför valet 2026. Returnerar (dict[etikett -> dict[parti -> procent]], status).
+    Tomt dict + felmeddelande om något gick fel — kraschar aldrig.
+    """
+    if not BS4_AVAILABLE:
+        return {}, "`beautifulsoup4` är inte installerat (se requirements.txt)."
+
+    try:
+        resp = requests.get(
+            WIKI_POLLS_URL, timeout=15,
+            headers={"User-Agent": "Valanalys2026-app/1.0"},
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        return {}, f"Kunde inte nå Wikipedia: {e}"
+
+    try:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tables = soup.find_all("table", class_="wikitable")
+        if not tables:
+            return {}, "Hittade ingen tabell på Wikipedia-sidan (layouten kan ha ändrats)."
+        rows = tables[0].find_all("tr")
+    except Exception as e:
+        return {}, f"Kunde inte tolka sidans HTML: {e}"
+
+    results = {}
+    for row in rows:
+        cells = row.find_all("td")
+        if len(cells) < 12:
+            continue  # troligen en sammanslagen (rowspan) rad vi inte säkert kan tolka
+        texts = [c.get_text(strip=True) for c in cells]
+        pollster = texts[0]
+        if not pollster.lower().startswith("novus"):
+            continue
+
+        def _to_float(t):
+            return float(t.replace(",", ".").replace("−", "-").replace("\u2212", "-"))
+
+        try:
+            v, s, mp, c, l, m, kd, sd = (_to_float(t) for t in texts[3:11])
+        except ValueError:
+            continue  # cellerna innehöll inte rena tal — hoppa över raden
+
+        try:
+            oth = _to_float(texts[11])
+        except ValueError:
+            oth = 0.0
+
+        end_date = _parse_wiki_fieldwork_end_date(texts[1])
+        if end_date is None:
+            continue
+        # Skyddar mot Wikipedias tvetydiga årtal på äldre rader (de anger inte
+        # alltid år) — vi bryr oss bara om mätningar från runt valrörelsen 2026.
+        if end_date < date(2025, 6, 1) or end_date > date(2026, 12, 31):
+            continue
+
+        label = f"{end_date.day} {_SWEDISH_MONTHS[end_date.month][:3]} {str(end_date.year)[2:]}"
+        results[label] = {"M": m, "L": l, "C": c, "KD": kd, "S": s, "V": v, "MP": mp, "SD": sd, "Annat": oth}
+
+    if not results:
+        return {}, "Hittade inga Novus-rader att tolka i Wikipedia-tabellen just nu."
+    return results, f"Hittade {len(results)} Novus-mätning(ar) på Wikipedia."
+
+
+def merge_new_novus_columns(new_data: dict):
+    """Lägger till nya, ej redan kända Novus-mätningar i sessionens data.
+    Ändrar bara den här sessionen — filen på disk rörs aldrig."""
+    current = st.session_state["df_novus_live"]
+    candidates = [(lbl, vals) for lbl, vals in new_data.items() if lbl not in current.columns]
+
+    def _sort_key(item):
+        try:
+            day_str, mon_str, yr_str = item[0].split()
+            month_num = [k for k, v in _SWEDISH_MONTHS.items() if v[:3] == mon_str][0]
+            return (int("20" + yr_str), month_num, int(day_str))
+        except Exception:
+            return (0, 0, 0)
+
+    candidates.sort(key=_sort_key)
+    added = []
+    for label, party_pcts in candidates:
+        current[label] = pd.Series(party_pcts)
+        added.append(label)
+    if added:
+        st.session_state["df_novus_live"] = current
+    return added
+
 PARTY_FULL_NAMES = {
     "M": "Moderaterna", "L": "Liberalerna", "C": "Centerpartiet", "KD": "Kristdemokraterna",
     "S": "Socialdemokraterna", "V": "Vänsterpartiet", "MP": "Miljöpartiet", "SD": "Sverigedemokraterna",
@@ -123,22 +268,24 @@ CUSTOM_SORTABLE_CSS = """
     font-size: 17px;
     padding: 10px 14px;
     border-radius: 10px 10px 0 0;
+    color: #ffffff !important;
 }
 .sortable-container-body { padding: 10px; }
 .sortable-item {
     font-size: 16px;
-    font-weight: 600;
+    font-weight: 700;
     padding: 12px 16px;
     margin: 6px 0;
     border-radius: 10px;
     cursor: grab;
+    color: #ffffff !important;
 }
-.sortable-container:nth-of-type(1) .sortable-container-header { background-color: #cfe2ff; }
-.sortable-container:nth-of-type(1) .sortable-item { background-color: #e7f1ff; border: 2px solid #6ea8fe; }
-.sortable-container:nth-of-type(2) .sortable-container-header { background-color: #ffe0c2; }
-.sortable-container:nth-of-type(2) .sortable-item { background-color: #fff1e6; border: 2px solid #fd7e14; }
-.sortable-container:nth-of-type(3) .sortable-container-header { background-color: #e9ecef; }
-.sortable-container:nth-of-type(3) .sortable-item { background-color: #f8f9fa; border: 2px dashed #adb5bd; color: #495057; }
+.sortable-container:nth-of-type(1) .sortable-container-header { background-color: #1f6feb; }
+.sortable-container:nth-of-type(1) .sortable-item { background-color: #2f6fb0; border: 2px solid #79b8ff; }
+.sortable-container:nth-of-type(2) .sortable-container-header { background-color: #e8590c; }
+.sortable-container:nth-of-type(2) .sortable-item { background-color: #b1470c; border: 2px solid #ffa94d; }
+.sortable-container:nth-of-type(3) .sortable-container-header { background-color: #495057; }
+.sortable-container:nth-of-type(3) .sortable-item { background-color: #343a40; border: 2px dashed #adb5bd; color: #e9ecef !important; }
 """
 
 
@@ -203,7 +350,17 @@ Annat\t1,5\t2,6\t2,1\t1,9\t1,4\t1,4\t1,8\t1,6\t1,0\t1,9\t2,0\t1,8\t1,2\t1,4"""
     return df, timeline_cols
 
 
-df_novus, timeline_cols = load_novus_data()
+_df_novus_static, _timeline_cols_static = load_novus_data()
+
+# Allt appen visar/räknar på jobbar mot en session-kopia, så att mätningar
+# hämtade från Wikipedia (se längre ner) kan läggas till utan att röra den
+# inkodade datan i load_novus_data() ovan. "Återställ"-knappen i Valnatt-fliken
+# går tillbaka till _df_novus_static.
+if "df_novus_live" not in st.session_state:
+    st.session_state["df_novus_live"] = _df_novus_static.copy()
+
+df_novus = st.session_state["df_novus_live"]
+timeline_cols = df_novus.columns
 
 # --------------------------------------------------------------------------
 # 2. Live-hämtning från Valmyndigheten
@@ -321,10 +478,39 @@ with tab0:
         "inte ett valresultat."
     )
     st.caption(
-        f"📌 Källa: [Novus väljarbarometer]({NOVUS_SOURCE_URL}). Siffrorna är "
-        f"manuellt inlagda i appens kod (senast uppdaterade {NOVUS_LAST_UPDATED}) — "
-        "appen hämtar INGET automatiskt från Novus. För att få in en ny mätning "
-        "måste någon redigera `load_novus_data()` i `app.py` och lägga till en kolumn."
+        f"📌 Grundkälla: [Novus väljarbarometer]({NOVUS_SOURCE_URL}). Novus egen sida "
+        "visar bara ett diagram (bild), inte text, så den går inte att läsa av "
+        f"automatiskt. Grunddatan är därför manuellt inlagd i appens kod (senast "
+        f"{NOVUS_LAST_UPDATED}) — men du kan hämta nyare mätningar automatiskt nedan."
+    )
+
+    col_fetch_wiki, col_reset_wiki, col_status_wiki = st.columns([1.3, 1, 2])
+    with col_fetch_wiki:
+        fetch_wiki_clicked = st.button("🔄 Hämta nya mätningar (Wikipedia)", key="fetch_wiki_btn")
+    with col_reset_wiki:
+        if df_novus.shape[1] != _df_novus_static.shape[1]:
+            if st.button("↩️ Återställ", key="reset_novus_btn"):
+                st.session_state["df_novus_live"] = _df_novus_static.copy()
+                st.rerun()
+
+    if fetch_wiki_clicked:
+        with st.spinner("Hämtar från Wikipedia..."):
+            new_data, wiki_status = fetch_novus_updates_from_wikipedia()
+        added = merge_new_novus_columns(new_data) if new_data else []
+        with col_status_wiki:
+            if added:
+                st.success(f"La till {len(added)}: {', '.join(added)}")
+            else:
+                st.info(wiki_status)
+        if added:
+            st.rerun()
+
+    st.caption(
+        "Hämtar Novus-rader ur Wikipedias löpande, community-underhållna "
+        "sammanställning av svenska opinionsmätningar (CC BY-SA, fri att "
+        "återanvända med attribution). Det är en tredjepartskälla som kan "
+        "släpa efter eller innehålla enstaka fel — dubbelkolla mot Novus "
+        "egen sida om en siffra ser konstig ut."
     )
 
     latest = df_novus[latest_col].sort_values(ascending=False)
@@ -429,9 +615,10 @@ with tab0:
 # === FLIK 1: TIDSLINJE =====================================================
 with tab1:
     st.caption(
-        f"📌 Källa: [Novus väljarbarometer]({NOVUS_SOURCE_URL}), manuellt "
-        f"inlagd i koden — senast uppdaterad {NOVUS_LAST_UPDATED}. Ingen "
-        "automatisk hämtning."
+        f"📌 Grundkälla: [Novus väljarbarometer]({NOVUS_SOURCE_URL}), senast "
+        f"inlagd i koden {NOVUS_LAST_UPDATED}. Vill du ha nyare mätningar, gå "
+        "till fliken **Valnatt** och tryck på 'Hämta nya mätningar (Wikipedia)' "
+        "— nya kolumner dyker då upp här också."
     )
     with st.expander("⚙️ Filtrera grafen", expanded=False):
         selected_parties = st.multiselect(
