@@ -3,21 +3,33 @@ Valanalys 2026 — en Streamlit-app för att följa opinionsläget och (när det
 finns tillgängligt) det officiella resultatet inför riksdagsvalet den
 13 september 2026.
 
-VIKTIGT innan du publicerar/kör den här på valnatten:
-  1. Fältet "Valmyndighetens API-URL" i sidopanelen är ett gissat/exempel-URL.
-     Verifiera den riktiga adressen mot val.se innan kl. 20:00 den 13/9, och
-     uppdatera DEFAULT_VALMYNDIGHETEN_URL nedan (eller mata in rätt URL direkt
-     i appen — den sparas bara i sessionen, inget behöver kodas om).
-  2. Allt i "Valnatt"-fliken som INTE uttryckligen kommer från ett lyckat
-     API-svar är tydligt märkt som exempel/väntar-läge. Lägg aldrig till
-     påhittade siffror eller rubriker attribuerade till riktiga redaktioner
-     (SVT, SR, TT, Valmyndigheten m.fl.) — det är grogrund för missinformation
-     om det råkar delas eller skärmdumpas.
+Om Valmyndighetens resultatfiler:
+  Till skillnad från ett tidigare antagande i den här filen är resultatet
+  INTE en enkel JSON-URL. Valmyndigheten publicerar en indexfil
+  (index.md5) som listar zip-arkiv; varje zip innehåller JSON-filer med
+  röst-/mandatfördelning. Se den officiella tekniska beskrivningen:
+  https://www.val.se/valresultat-och-statistik/statistik-och-data/teknisk-beskrivning-av-resultatfiler
+  Koden nedan (VAL_INDEX_URL, fetch_valmyndigheten_national_totals) bygger
+  på den beskrivningen. Filerna med skarpt valresultat finns inte
+  förrän valkvällen den 13/9 — innan dess är "väntar på data" väntat.
+
+Om du hittar en avvikelse mot verkligheten på valnatten: kolla först om
+Valmyndigheten ändrat filstrukturen (händer ibland, se "Korrigering av
+filnamn" på sidan ovan) och justera JSON-parsningen i
+fetch_valmyndigheten_national_totals() nedan.
+
+Allt i "Valnatt"-fliken som INTE uttryckligen kommer från ett lyckat
+API-svar är tydligt märkt som exempel/väntar-läge. Lägg aldrig till
+påhittade siffror eller rubriker attribuerade till riktiga redaktioner
+(SVT, SR, TT, Valmyndigheten m.fl.) — det är grogrund för missinformation
+om det råkar delas eller skärmdumpas.
 """
 
 import io
+import json
 import re
 import time
+import zipfile
 from datetime import datetime, date, timezone, timedelta
 from urllib.parse import quote
 
@@ -50,11 +62,10 @@ st.set_page_config(page_title="Valanalys 2026", page_icon="🗳️", layout="wid
 SWEDEN_TZ = timezone(timedelta(hours=2))
 POLLS_CLOSE = datetime(2026, 9, 13, 20, 0, tzinfo=SWEDEN_TZ)
 
-# OBS: inte verifierad mot Valmyndighetens faktiska produktions-URL för 2026.
-# Kontrollera och uppdatera innan valnatten (se modulens docstring).
-DEFAULT_VALMYNDIGHETEN_URL = (
-    "https://data.val.se/val/val2026/riksdagsval/00/00/00/preliminart.json"
-)
+# Verifierat mot Valmyndighetens tekniska beskrivning (10 sep 2026):
+# https://www.val.se/valresultat-och-statistik/statistik-och-data/teknisk-beskrivning-av-resultatfiler
+VAL_INDEX_URL = "https://resultat.val.se/resultatfiler/val2026/index.md5"
+VAL_BASE_URL = "https://resultat.val.se/resultatfiler/val2026/"
 
 PARTY_COLORS = {
     "S": "#E8112d", "M": "#52BDEC", "SD": "#DDDD00", "C": "#009933",
@@ -365,55 +376,117 @@ timeline_cols = df_novus.columns
 # --------------------------------------------------------------------------
 # 2. Live-hämtning från Valmyndigheten
 #
-# Cachas medvetet INTE med @st.cache_data, eftersom det skulle cacha även
-# felsvar (t.ex. 404 innan valnatten) i onödigt lång tid. Vi styr istället
-# själva hur ofta ett nytt anrop får göras via session_state, så att en
-# knapptryckning alltid ger ett färskt försök men vi ändå inte spammar
-# servern om något (t.ex. auto-refresh) anropar funktionen ofta.
+# Verifierat mot Valmyndighetens tekniska beskrivning (se modulens docstring):
+# resultatet är INTE en enkel JSON-URL. Man laddar först ner en indexfil
+# (VAL_INDEX_URL) som listar tillgängliga zip-arkiv + checksummor, hittar
+# raden för riksdagsvalet (Val_2026_<preliminar|slutlig>_00_RD.zip), laddar
+# ner det zip-arkivet och läser "summering"-filen inuti — den innehåller
+# röster per parti, aggregerat per kommun, vilket vi summerar till en
+# nationell totalsumma.
+#
+# Cachas medvetet INTE med @st.cache_data (skulle cacha fel i onödan). Vi
+# styr istället throttling manuellt via session_state, och Valmyndigheten
+# svarar själva med 429 vid för hög belastning — det hanteras explicit.
 # --------------------------------------------------------------------------
 
-MIN_SECONDS_BETWEEN_FETCH = 10
+MIN_SECONDS_BETWEEN_FETCH = 20
 
 
-def fetch_valmyndigheten_data(url: str, force: bool = False):
+def _find_zip_path_from_index(index_text: str, want_substring: str):
+    """Letar igenom indexfilens rader (md5-hash + relativ sökväg) efter en
+    rad vars sökväg innehåller `want_substring`. Returnerar sökvägen (utan
+    inledande './') eller None om ingen rad matchade."""
+    for line in index_text.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        path = parts[-1]
+        if want_substring in path:
+            return path.lstrip("./")
+    return None
+
+
+def fetch_valmyndigheten_national_totals(rakningstillfalle: str = "preliminar", force: bool = False):
+    """
+    Hämtar nationella röstetal för riksdagsvalet (00 RD) från Valmyndighetens
+    riktiga resultatfiler. rakningstillfalle: "preliminar" eller "slutlig".
+    Returnerar (DataFrame | None, statusmeddelande, metadata-sträng | None).
+    Kraschar aldrig — varje felkälla fångas och ger ett tydligt meddelande.
+    """
     now = time.time()
-    last_ts = st.session_state.get("live_fetch_ts", 0)
-    if not force and (now - last_ts) < MIN_SECONDS_BETWEEN_FETCH and "live_fetch_result" in st.session_state:
-        return st.session_state["live_fetch_result"]
+    cache_key = f"val_fetch_{rakningstillfalle}"
+    last_ts = st.session_state.get(f"{cache_key}_ts", 0)
+    if not force and (now - last_ts) < MIN_SECONDS_BETWEEN_FETCH and f"{cache_key}_result" in st.session_state:
+        return st.session_state[f"{cache_key}_result"]
 
-    try:
-        response = requests.get(url, timeout=6)
-    except requests.exceptions.RequestException as e:
-        result = (None, f"Nätverksfel: {e}")
-        st.session_state["live_fetch_ts"] = now
-        st.session_state["live_fetch_result"] = result
+    def _store(result):
+        st.session_state[f"{cache_key}_ts"] = now
+        st.session_state[f"{cache_key}_result"] = result
         return result
 
-    if response.status_code == 200:
-        try:
-            data = response.json()
-            parties_data = []
-            for party in data.get("partier", []):
-                parties_data.append(
-                    {
-                        "Parti": party.get("förkortning", party.get("kod", "Okänt")),
-                        "Röster": party.get("antalRöster", party.get("rostAntal", 0)),
-                        "Procent": party.get("andelRöster", party.get("rostAndel", 0.0)),
-                    }
-                )
-            df = pd.DataFrame(parties_data)
-            if df.empty:
-                result = (None, "200 OK, men svaret innehöll ingen partidata (kontrollera fältnamnen i JSON-strukturen).")
-            else:
-                result = (df, "200 OK")
-        except ValueError:
-            result = (None, "200 OK, men svaret gick inte att tolka som JSON.")
-    else:
-        result = (None, f"HTTP {response.status_code}")
+    try:
+        idx_resp = requests.get(VAL_INDEX_URL, timeout=15)
+    except requests.exceptions.RequestException as e:
+        return _store((None, f"Kunde inte hämta indexfilen: {e}", None))
 
-    st.session_state["live_fetch_ts"] = now
-    st.session_state["live_fetch_result"] = result
-    return result
+    if idx_resp.status_code == 429:
+        return _store((None, "429 Too Many Requests — Valmyndigheten ber oss vänta. Försök igen om en liten stund.", None))
+    if idx_resp.status_code != 200:
+        return _store((None, f"Indexfilen svarade HTTP {idx_resp.status_code} (normalt innan valnatten).", None))
+
+    zip_filename = f"Val_2026_{rakningstillfalle}_00_RD.zip"
+    rel_path = _find_zip_path_from_index(idx_resp.text, zip_filename)
+    if rel_path is None:
+        return _store((None, f"Hittade inte '{zip_filename}' i indexfilen ännu (normalt innan valnatten).", None))
+
+    try:
+        zip_resp = requests.get(VAL_BASE_URL + rel_path, timeout=30)
+    except requests.exceptions.RequestException as e:
+        return _store((None, f"Kunde inte hämta resultatfilen: {e}", None))
+
+    if zip_resp.status_code == 429:
+        return _store((None, "429 Too Many Requests — Valmyndigheten ber oss vänta. Försök igen om en liten stund.", None))
+    if zip_resp.status_code != 200:
+        return _store((None, f"Resultatfilen svarade HTTP {zip_resp.status_code}.", None))
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+            json_name = next((n for n in zf.namelist() if "summering" in n.lower() and n.endswith(".json")), None)
+            if json_name is None:
+                return _store((None, "Hittade ingen summeringsfil i zip-arkivet (strukturen kan ha ändrats).", None))
+            with zf.open(json_name) as f:
+                data = json.load(f)
+    except zipfile.BadZipFile:
+        return _store((None, "Filen var inte en giltig zip (avbruten nedladdning?).", None))
+    except Exception as e:
+        return _store((None, f"Kunde inte tolka resultatfilen: {e}", None))
+
+    totals, other_votes, total_paverkande = {}, 0, 0
+    try:
+        for kommun in data.get("kommuner", []):
+            rpm = kommun.get("rostfordelning", {}).get("rosterPaverkaMandat", {})
+            total_paverkande += rpm.get("antalRoster", 0) or 0
+            for p in rpm.get("partiRoster", []):
+                kod = p.get("partiforkortning", p.get("partikod", "Okänt"))
+                totals[kod] = totals.get(kod, 0) + (p.get("antalRoster", 0) or 0)
+            other_votes += rpm.get("rosterOvrigaPartier", {}).get("antalRoster", 0) or 0
+    except Exception as e:
+        return _store((None, f"Oväntad struktur i resultatfilen: {e}", None))
+
+    if total_paverkande == 0:
+        return _store((None, "Resultatfilen finns men innehåller inga räknade röster ännu.", None))
+
+    rows = [{"Parti": kod, "Röster": v, "Procent": 100 * v / total_paverkande} for kod, v in totals.items()]
+    if other_votes:
+        rows.append({"Parti": "Annat", "Röster": other_votes, "Procent": 100 * other_votes / total_paverkande})
+    df = pd.DataFrame(rows).sort_values("Procent", ascending=False).reset_index(drop=True)
+
+    meta = (
+        f"{data.get('antalValdistriktRaknade', '?')} av "
+        f"{data.get('antalValdistriktSomSkaRaknas', '?')} valdistrikt räknade. "
+        f"Senast uppdaterad: {data.get('senasteUppdateringstid', '?')}."
+    )
+    return _store((df, f"Hämtat ({rakningstillfalle}).", meta))
 
 
 # --------------------------------------------------------------------------
@@ -551,40 +624,37 @@ with tab0:
 
     st.subheader("Officiellt preliminärt resultat")
     st.caption(
-        "Den här panelen försöker hämta data direkt från Valmyndigheten. "
-        "Fram till dess att räkningen börjar kvällen den 13 september kommer "
-        "anropet normalt att misslyckas eller ge tomt resultat — det är väntat, "
-        "inte ett fel i appen."
+        "Hämtar riksdagsvalets nationella röstetal direkt från Valmyndighetens "
+        "riktiga resultatfiler (indexfil → zip-arkiv → JSON, se "
+        "[teknisk beskrivning](https://www.val.se/valresultat-och-statistik/statistik-och-data/teknisk-beskrivning-av-resultatfiler)). "
+        "Filerna finns inte förrän valkvällen den 13 september — innan dess "
+        "är \"väntar på data\" väntat, inte ett fel i appen."
     )
     st.caption(
-        "📌 Hämtas **inte** automatiskt i bakgrunden. Ett nytt anrop görs bara när "
-        "sidan laddas om eller du trycker på knappen nedan, och är då spärrad till "
-        f"max ett nytt anrop var {MIN_SECONDS_BETWEEN_FETCH}:e sekund för att inte "
-        "belasta Valmyndighetens server i onödan."
+        "📌 Hämtas **inte** automatiskt i bakgrunden. Ett nytt anrop görs bara "
+        "när du trycker på knappen nedan, spärrat till max ett nytt anrop var "
+        f"{MIN_SECONDS_BETWEEN_FETCH}:e sekund. Valmyndigheten kan även själva "
+        "svara 429 vid hög belastning — appen visar det tydligt istället för att krascha."
     )
 
-    with st.expander("⚙️ API-inställningar"):
-        api_url = st.text_input(
-            "Valmyndighetens API-URL",
-            value=st.session_state.get("api_url_override", DEFAULT_VALMYNDIGHETEN_URL),
-            help="Kontrollera och uppdatera denna mot val.se:s faktiska adress innan valnatten.",
+    col_mode, col_fetch, col_status = st.columns([1.2, 1, 2])
+    with col_mode:
+        rakningstillfalle = st.radio(
+            "Räkningstillfälle", ["preliminar", "slutlig"],
+            format_func=lambda x: "Preliminär (valkvällen)" if x == "preliminar" else "Slutlig (veckan efter)",
+            horizontal=True, key="rakningstillfalle_choice",
         )
-        st.session_state["api_url_override"] = api_url
-
-    col_fetch, col_status = st.columns([1, 3])
     with col_fetch:
-        force_refresh = st.button("🔄 Hämta senaste resultatet", width='stretch')
+        force_refresh = st.button("🔄 Hämta senaste resultatet", key="fetch_val_btn")
 
-    df_live, status = fetch_valmyndigheten_data(api_url, force=force_refresh)
+    df_live, status, meta = fetch_valmyndigheten_national_totals(rakningstillfalle, force=force_refresh)
 
     with col_status:
         st.caption(f"Senaste anropsstatus: `{status}`")
 
     if df_live is not None and not df_live.empty:
-        st.success("✅ Live-data hämtad från Valmyndigheten.")
-        df_show = df_live.copy()
-        if "Parti" in df_show.columns:
-            df_show = df_show.sort_values("Procent", ascending=False)
+        st.success(f"✅ Live-data hämtad från Valmyndigheten. {meta or ''}")
+        df_show = df_live.copy().sort_values("Procent", ascending=False)
         fig_live = px.bar(
             df_show, x="Procent", y="Parti", orientation="h",
             color="Parti", color_discrete_map=PARTY_COLORS,
@@ -600,8 +670,8 @@ with tab0:
         st.markdown('<span class="demo-badge">VÄNTAR PÅ DATA</span>', unsafe_allow_html=True)
         st.info(
             "Inget officiellt resultat tillgängligt ännu. Så fort Valmyndigheten "
-            "publicerar preliminära siffror och API-URL:en ovan stämmer visas de här "
-            "automatiskt. Se opinionsläget högre upp på sidan under tiden."
+            "publicerar resultatfiler för riksdagsvalet visas de här automatiskt. "
+            "Se opinionsläget högre upp på sidan under tiden."
         )
 
     st.markdown("---")
@@ -855,19 +925,27 @@ with tab_custom:
 
 
 with tab4:
-    st.subheader("🔴 Valmyndigheten API — teknisk status")
-    st.markdown(f"Testar mot: `{st.session_state.get('api_url_override', DEFAULT_VALMYNDIGHETEN_URL)}`")
+    st.subheader("🔴 Valmyndigheten — teknisk status")
+    st.markdown(f"Indexfil: `{VAL_INDEX_URL}`")
     st.caption(
-        "Samma anrop som i fliken Valnatt, men här utan grafik — bra för att "
-        "felsöka URL och JSON-struktur innan valnatten."
+        "Samma hämtning som i fliken Valnatt (indexfil → zip → JSON), men här "
+        "utan grafik — bra för att felsöka innan valnatten. Se "
+        "[teknisk beskrivning](https://www.val.se/valresultat-och-statistik/statistik-och-data/teknisk-beskrivning-av-resultatfiler) "
+        "för hela filformatet."
     )
 
-    if st.button("🔄 Testa anrop nu"):
-        df_test, status_test = fetch_valmyndigheten_data(
-            st.session_state.get("api_url_override", DEFAULT_VALMYNDIGHETEN_URL), force=True
+    test_rakningstillfalle = st.radio(
+        "Räkningstillfälle att testa", ["preliminar", "slutlig"],
+        format_func=lambda x: "Preliminär" if x == "preliminar" else "Slutlig",
+        horizontal=True, key="test_rakningstillfalle_choice",
+    )
+
+    if st.button("🔄 Testa anrop nu", key="test_val_btn"):
+        df_test, status_test, meta_test = fetch_valmyndigheten_national_totals(
+            test_rakningstillfalle, force=True
         )
         if df_test is not None and not df_test.empty:
-            st.success(f"✅ Lyckades — status: {status_test}")
+            st.success(f"✅ Lyckades — {status_test} {meta_test or ''}")
             st.dataframe(
                 df_test.style.format({"Procent": "{:.1f} %", "Röster": "{:,}"}),
                 width='stretch',
@@ -875,7 +953,9 @@ with tab4:
         else:
             st.warning(f"⚠️ Ingen giltig data ännu. Status: **{status_test}**")
             st.info(
-                "Helt normalt innan valet dragit igång på riktigt. Kontrollera "
-                "URL:en och fältnamnen (`förkortning`/`antalRöster`/`andelRöster` "
-                "eller motsvarande) mot Valmyndighetens faktiska JSON-schema."
+                "Helt normalt innan valnatten. Om felet kvarstår EFTER att "
+                "räkningen startat: kontrollera om Valmyndigheten bytt "
+                "filnamnsmönster (de har gjort det tidigare, se \"Korrigering "
+                "av filnamn\" på deras sida) och justera "
+                "`fetch_valmyndigheten_national_totals()` i koden."
             )
