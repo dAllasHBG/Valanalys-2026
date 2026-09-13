@@ -256,6 +256,10 @@ BLOCK_PRESETS = {
         "a_name": "Tidöpartierna", "a_parties": ["M", "KD", "L", "SD"],
         "b_name": "Rödgröna", "b_parties": ["S", "V", "MP"],
     },
+    "Tidö vs oppositionen (inkl. C, SVT:s indelning)": {
+        "a_name": "Tidöpartierna", "a_parties": ["M", "KD", "L", "SD"],
+        "b_name": "Oppositionen (inkl. C)", "b_parties": ["S", "V", "C", "MP"],
+    },
     "Alliansen vs Övriga": {
         "a_name": "Alliansen", "a_parties": ["M", "C", "L", "KD"],
         "b_name": "Övriga", "b_parties": ["S", "V", "MP", "SD"],
@@ -272,6 +276,31 @@ BLOCK_PRESETS = {
         "a_name": "Alla utom SD", "a_parties": ["M", "L", "C", "KD", "S", "V", "MP"],
         "b_name": "SD", "b_parties": ["SD"],
     },
+}
+
+# Ögonblicksbild av de sista mätningarna innan valet, sammanställda av SVT
+# den 12 september 2026. Blockindelning i just den här jämförelsen: S+V+C+MP
+# mot SD+M+KD+L (SVT räknar C till oppositionssidan här — annorlunda än
+# appens egen "Blocken"-flik som exkluderar C helt). Alla fem institut visar
+# S+V+C+MP-blocket ledande, men med mycket olika marginal — det är poängen
+# med SVT:s artikel. Manuellt inlagt (en engångsbild, inte automatiskt
+# hämtat) — uppdatera eller ta bort när den känns inaktuell.
+# Källa: https://www.svt.se/nyheter/inrikes/stora-skillnader-i-sista-matningarna-infor-valet-2026
+INSTITUTE_BLOCK_COMPARISON = {
+    "datum": "12 september 2026",
+    "kalla_url": "https://www.svt.se/nyheter/inrikes/stora-skillnader-i-sista-matningarna-infor-valet-2026",
+    "ledande_block": "S+V+C+MP",
+    "rader": [
+        {"institut": "SVT/Verian", "period": "4–10 sep", "blockskillnad": 5.6,
+         "kalla": "https://www.svt.se/nyheter/inrikes/svtverian-liberalerna-fortsatter-rusa-tar-valjare-fran-moderaterna"},
+        {"institut": "SR/Indikator", "period": "2–10 sep", "blockskillnad": 3.2,
+         "kalla": "https://www.sverigesradio.se/artikel/forspranget-minskar-for-de-rodgrona-i-ny-matning"},
+        {"institut": "TV4/Novus", "period": "7–10 sep", "blockskillnad": 3.0,
+         "kalla": "https://www.tv4.se/artikel/4lEtVYL5pNdnv2SXu42Fk9/efter-bensinbeskedet-mp-rasar-i-opinionen"},
+        {"institut": "Demoskop", "period": None, "blockskillnad": 2.5, "kalla": None},
+        {"institut": "DN/Ipsos", "period": "7–10 sep", "blockskillnad": 0.3,
+         "kalla": "https://www.dn.se/sverige/dn-ipsos-dott-lopp-mellan-blocken-valrysare-vantar-pa-sondag/"},
+    ],
 }
 
 CUSTOM_SORTABLE_CSS = """
@@ -652,6 +681,42 @@ with tab0:
             for p, d in delta.items():
                 arrow = "🔺" if d > 0.05 else ("🔻" if d < -0.05 else "➖")
                 st.write(f"{arrow} **{p}**: {d:+.1f} procentenheter")
+
+    st.markdown("---")
+
+    st.subheader("🔀 Vad säger andra institut just nu?")
+    st.caption(
+        f"Novus är bara ett institut. De sista mätningarna innan valet "
+        f"({INSTITUTE_BLOCK_COMPARISON['datum']}) pekar alla åt samma håll — "
+        f"blocket **{INSTITUTE_BLOCK_COMPARISON['ledande_block']}** leder i "
+        "samtliga — men med väldigt olika marginal, från under en halv "
+        "procentenhet till nästan sex. Det säger något om hur osäkert läget "
+        "faktiskt är inför valdagen. OBS: den här blockindelningen räknar C "
+        "till oppositionssidan, till skillnad från fliken 'Blocken' här i "
+        "appen — testa gärna samma indelning själv i 'Egna block'."
+    )
+
+    _inst_rows = sorted(INSTITUTE_BLOCK_COMPARISON["rader"], key=lambda r: r["blockskillnad"], reverse=True)
+    fig_inst = px.bar(
+        pd.DataFrame(_inst_rows), x="blockskillnad", y="institut", orientation="h",
+        text="blockskillnad", color_discrete_sequence=["#6f42c1"],
+    )
+    fig_inst.update_traces(texttemplate="%{text:.1f} pe")
+    fig_inst.update_layout(
+        showlegend=False, height=280, margin=dict(l=0, r=0, t=10, b=0),
+        xaxis_title=f"Övertag för {INSTITUTE_BLOCK_COMPARISON['ledande_block']} (procentenheter)",
+        yaxis_title="",
+    )
+    st.plotly_chart(fig_inst, width='stretch')
+
+    with st.expander("Källor för varje enskild mätning"):
+        for r in _inst_rows:
+            period_txt = f" ({r['period']})" if r.get("period") else ""
+            if r.get("kalla"):
+                st.markdown(f"- [{r['institut']}]({r['kalla']}){period_txt}: {r['blockskillnad']:.1f} pe")
+            else:
+                st.markdown(f"- {r['institut']}{period_txt}: {r['blockskillnad']:.1f} pe")
+    st.caption(f"Sammanställning: [SVT Nyheter, {INSTITUTE_BLOCK_COMPARISON['datum']}]({INSTITUTE_BLOCK_COMPARISON['kalla_url']}). Manuellt inlagd engångsbild, inte automatiskt uppdaterad.")
 
     st.markdown("---")
 
