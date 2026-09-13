@@ -211,6 +211,16 @@ def fetch_novus_updates_from_wikipedia():
     return results, f"Hittade {len(results)} Novus-mätning(ar) på Wikipedia."
 
 
+# Cachas 15 minuter, delat mellan alla som har appen öppen samtidigt — så att
+# appen kan kolla automatiskt varje gång någon öppnar sidan (se
+# "Automatisk koll..." nedan) utan att i praktiken slå mot Wikipedia på varje
+# enskild sidladdning eller knapptryckning. Manuell "Hämta nu"-knapp tvingar
+# fram en färsk hämtning genom att rensa just den här cachen först.
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_fetch_novus_updates_from_wikipedia():
+    return fetch_novus_updates_from_wikipedia()
+
+
 def merge_new_novus_columns(new_data: dict):
     """Lägger till nya, ej redan kända Novus-mätningar i sessionens data.
     Ändrar bara den här sessionen — filen på disk rörs aldrig."""
@@ -368,6 +378,20 @@ _df_novus_static, _timeline_cols_static = load_novus_data()
 # går tillbaka till _df_novus_static.
 if "df_novus_live" not in st.session_state:
     st.session_state["df_novus_live"] = _df_novus_static.copy()
+
+# Automatisk koll mot Wikipedia varje gång någon öppnar/laddar om sidan (en
+# gång per session — inte på varenda knapptryckning), så att opinionssiffrorna
+# är så uppdaterade som möjligt utan att man behöver komma ihåg att trycka på
+# en knapp. Den underliggande hämtningen är cachead 15 minuter (se
+# _cached_fetch_novus_updates_from_wikipedia ovan), så det här slår i
+# praktiken bara mot Wikipedia med jämna mellanrum, inte per besökare.
+if "novus_auto_checked" not in st.session_state:
+    with st.spinner("Kollar om det finns nyare opinionsmätningar..."):
+        _auto_new_data, _auto_status = _cached_fetch_novus_updates_from_wikipedia()
+    _auto_added = merge_new_novus_columns(_auto_new_data) if _auto_new_data else []
+    st.session_state["novus_auto_checked"] = True
+    st.session_state["novus_auto_check_status"] = _auto_status
+    st.session_state["novus_auto_check_added"] = _auto_added
 
 df_novus = st.session_state["df_novus_live"]
 timeline_cols = df_novus.columns
@@ -553,12 +577,19 @@ with tab0:
         f"📌 Grundkälla: [Novus väljarbarometer]({NOVUS_SOURCE_URL}). Novus egen sida "
         "visar bara ett diagram (bild), inte text, så den går inte att läsa av "
         f"automatiskt. Grunddatan är därför manuellt inlagd i appens kod (senast "
-        f"{NOVUS_LAST_UPDATED}) — men du kan hämta nyare mätningar automatiskt nedan."
+        f"{NOVUS_LAST_UPDATED}) — men appen dubbelkollar automatiskt mot Wikipedia "
+        "varje gång sidan öppnas för att fylla på med nyare mätningar."
     )
+
+    _auto_added = st.session_state.get("novus_auto_check_added", [])
+    if _auto_added:
+        st.success(f"🔄 Automatisk koll vid sidladdning hittade {len(_auto_added)} ny(a) mätning(ar): {', '.join(_auto_added)}")
+    else:
+        st.caption(f"🔄 Automatisk koll vid sidladdning: {st.session_state.get('novus_auto_check_status', '—')}")
 
     col_fetch_wiki, col_reset_wiki, col_status_wiki = st.columns([1.3, 1, 2])
     with col_fetch_wiki:
-        fetch_wiki_clicked = st.button("🔄 Hämta nya mätningar (Wikipedia)", key="fetch_wiki_btn")
+        fetch_wiki_clicked = st.button("🔄 Tvinga fram färsk koll nu", key="fetch_wiki_btn")
     with col_reset_wiki:
         if df_novus.shape[1] != _df_novus_static.shape[1]:
             if st.button("↩️ Återställ", key="reset_novus_btn"):
@@ -566,8 +597,9 @@ with tab0:
                 st.rerun()
 
     if fetch_wiki_clicked:
+        _cached_fetch_novus_updates_from_wikipedia.clear()  # hoppa förbi 15-minuterscachen
         with st.spinner("Hämtar från Wikipedia..."):
-            new_data, wiki_status = fetch_novus_updates_from_wikipedia()
+            new_data, wiki_status = _cached_fetch_novus_updates_from_wikipedia()
         added = merge_new_novus_columns(new_data) if new_data else []
         with col_status_wiki:
             if added:
@@ -582,7 +614,9 @@ with tab0:
         "sammanställning av svenska opinionsmätningar (CC BY-SA, fri att "
         "återanvända med attribution). Det är en tredjepartskälla som kan "
         "släpa efter eller innehålla enstaka fel — dubbelkolla mot Novus "
-        "egen sida om en siffra ser konstig ut."
+        "egen sida om en siffra ser konstig ut. Den automatiska kollen är "
+        "delad mellan alla besökare och uppdateras var 15:e minut, så den "
+        "belastar inte Wikipedia per sidladdning."
     )
 
     latest = df_novus[latest_col].sort_values(ascending=False)
@@ -842,7 +876,25 @@ with tab_custom:
     def _block_pct(codes):
         return df_novus.loc[codes, latest_col_cb].sum() if codes else 0.0
 
-    if SORTABLES_AVAILABLE:
+    def _sync_simple_mode_widgets():
+        current = st.session_state.get("custom_block_state", {})
+        st.session_state["block_a_multiselect"] = current.get("a", [])
+        st.session_state["block_b_multiselect"] = current.get("b", [])
+
+    use_simple_mode = st.checkbox(
+        "Använd enkel lista istället för dra-och-släpp",
+        value=st.session_state.get("use_simple_block_ui", False),
+        key="use_simple_block_ui",
+        on_change=_sync_simple_mode_widgets,
+        help=(
+            "Dra-och-släpp bygger på ett litet, inte helt moget "
+            "Streamlit-tillägg (streamlit-sortables) som ibland känns "
+            "trögt eller laggigt. Kryssa i den här om det stökar — den "
+            "vanliga listan är snabbare och mer pålitlig."
+        ),
+    )
+
+    if SORTABLES_AVAILABLE and not use_simple_mode:
         st.caption("🖱️ Dra partierna mellan rutorna för att bygga dina egna block.")
         container_items = [
             {
@@ -864,15 +916,23 @@ with tab_custom:
             "b": [code_from_chip(x) for x in sorted_result[1]["items"]],
             "unassigned": [code_from_chip(x) for x in sorted_result[2]["items"]],
         }
-        st.session_state["custom_block_state"] = new_state
         block_a_parties = new_state["a"]
         block_b_parties = new_state["b"]
+        if new_state != state:
+            # Utan den här forcerade omkörningen ritas rutorna upp med det
+            # GAMLA läget en gång till innan de hinner uppdateras — det är
+            # det som känns som lag/bugg när man drar partier. Genom att
+            # köra om skriptet direkt så fort ett drag faktiskt ändrat
+            # något visas alltid det korrekta, aktuella läget.
+            st.session_state["custom_block_state"] = new_state
+            st.rerun()
     else:
-        st.info(
-            "💡 Installera `streamlit-sortables` (finns i requirements.txt) för att "
-            "kunna dra-och-släppa partier mellan blocken. Använder vanliga "
-            "väljare tills vidare."
-        )
+        if not SORTABLES_AVAILABLE:
+            st.info(
+                "💡 Installera `streamlit-sortables` (finns i requirements.txt) för att "
+                "kunna dra-och-släppa partier mellan blocken. Använder vanliga "
+                "väljare tills vidare."
+            )
         with st.container(border=True):
             st.caption(f"**{block_a_name} — {_block_pct(state['a']):.1f}%**")
             block_a_parties = st.multiselect(
@@ -891,6 +951,12 @@ with tab_custom:
                 f"⚠️ {', '.join(sorted(overlap))} ingår i båda blocken — "
                 "totalerna nedan räknar då med partiet dubbelt."
             )
+        # Håll session-läget i synk även i enkelt läge, så att man kan växla
+        # tillbaka till dra-och-släpp utan att tappa sitt urval.
+        st.session_state["custom_block_state"] = {
+            "a": block_a_parties, "b": block_b_parties,
+            "unassigned": [p for p in parties_selectable if p not in block_a_parties and p not in block_b_parties],
+        }
 
     a_pct = df_novus.loc[block_a_parties, latest_col_cb].sum() if block_a_parties else 0.0
     b_pct = df_novus.loc[block_b_parties, latest_col_cb].sum() if block_b_parties else 0.0
