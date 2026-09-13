@@ -515,15 +515,21 @@ def fetch_valmyndigheten_national_totals(rakningstillfalle: str = "preliminar", 
 
     totals, other_votes, total_paverkande = {}, 0, 0
     try:
-        for kommun in data.get("kommuner", []):
-            rpm = kommun.get("rostfordelning", {}).get("rosterPaverkaMandat", {})
+        # OBS: .get(key, {}) skyddar bara mot att nyckeln SAKNAS — om
+        # Valmyndighetens JSON har t.ex. "rostfordelning": null (explicit
+        # null, vanligt för kommuner som ännu inte rapporterat något) så
+        # returnerar .get() None ändå, och nästa .get()-anrop på None
+        # kraschar. "x or {}"/"x or []" fångar båda fallen.
+        for kommun in (data.get("kommuner") or []):
+            rf = (kommun.get("rostfordelning") or {})
+            rpm = (rf.get("rosterPaverkaMandat") or {})
             total_paverkande += rpm.get("antalRoster", 0) or 0
-            for p in rpm.get("partiRoster", []):
-                kod = p.get("partiforkortning", p.get("partikod", "Okänt"))
+            for p in (rpm.get("partiRoster") or []):
+                kod = p.get("partiforkortning") or p.get("partikod") or "Okänt"
                 totals[kod] = totals.get(kod, 0) + (p.get("antalRoster", 0) or 0)
-            other_votes += rpm.get("rosterOvrigaPartier", {}).get("antalRoster", 0) or 0
+            other_votes += (rpm.get("rosterOvrigaPartier") or {}).get("antalRoster", 0) or 0
     except Exception as e:
-        return _store((None, f"Oväntad struktur i resultatfilen: {e}", None))
+        return _store((None, f"Oväntad struktur i resultatfilen: {type(e).__name__}: {e}", None))
 
     if total_paverkande == 0:
         return _store((None, "Resultatfilen finns men innehåller inga räknade röster ännu.", None))
@@ -534,9 +540,9 @@ def fetch_valmyndigheten_national_totals(rakningstillfalle: str = "preliminar", 
     df = pd.DataFrame(rows).sort_values("Procent", ascending=False).reset_index(drop=True)
 
     meta = (
-        f"{data.get('antalValdistriktRaknade', '?')} av "
-        f"{data.get('antalValdistriktSomSkaRaknas', '?')} valdistrikt räknade. "
-        f"Senast uppdaterad: {data.get('senasteUppdateringstid', '?')}."
+        f"{data.get('antalValdistriktRaknade') or '?'} av "
+        f"{data.get('antalValdistriktSomSkaRaknas') or '?'} valdistrikt räknade. "
+        f"Senast uppdaterad: {data.get('senasteUppdateringstid') or '?'}."
     )
     return _store((df, f"Hämtat ({rakningstillfalle}).", meta))
 
