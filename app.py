@@ -302,8 +302,9 @@ def party_color(p: str) -> str:
     return PARTY_COLORS.get(p, FALLBACK_COLOR)
 
 
-def chip_label(code: str) -> str:
-    return f"{code} — {PARTY_FULL_NAMES.get(code, code)}"
+def chip_label(code: str, pct=None) -> str:
+    base = f"{code} — {PARTY_FULL_NAMES.get(code, code)}"
+    return f"{base} · {pct:.1f}%" if pct is not None else base
 
 
 def code_from_chip(label: str) -> str:
@@ -836,13 +837,26 @@ with tab_custom:
         block_b_name = st.text_input("Namn på block B", key="block_b_name")
 
     state = st.session_state["custom_block_state"]
+    latest_col_cb = timeline_cols[-1]
+
+    def _block_pct(codes):
+        return df_novus.loc[codes, latest_col_cb].sum() if codes else 0.0
 
     if SORTABLES_AVAILABLE:
         st.caption("🖱️ Dra partierna mellan rutorna för att bygga dina egna block.")
         container_items = [
-            {"header": f"🟦 {block_a_name} ({len(state['a'])})", "items": [chip_label(p) for p in state["a"]]},
-            {"header": f"🟧 {block_b_name} ({len(state['b'])})", "items": [chip_label(p) for p in state["b"]]},
-            {"header": f"⚪ Inte tilldelat ({len(state['unassigned'])})", "items": [chip_label(p) for p in state["unassigned"]]},
+            {
+                "header": f"🟦 {block_a_name} — {_block_pct(state['a']):.1f}% ({len(state['a'])} partier)",
+                "items": [chip_label(p, df_novus.loc[p, latest_col_cb]) for p in state["a"]],
+            },
+            {
+                "header": f"🟧 {block_b_name} — {_block_pct(state['b']):.1f}% ({len(state['b'])} partier)",
+                "items": [chip_label(p, df_novus.loc[p, latest_col_cb]) for p in state["b"]],
+            },
+            {
+                "header": f"⚪ Inte tilldelat — {_block_pct(state['unassigned']):.1f}% ({len(state['unassigned'])} partier)",
+                "items": [chip_label(p, df_novus.loc[p, latest_col_cb]) for p in state["unassigned"]],
+            },
         ]
         sorted_result = sort_items(container_items, multi_containers=True, custom_style=CUSTOM_SORTABLE_CSS)
         new_state = {
@@ -860,12 +874,16 @@ with tab_custom:
             "väljare tills vidare."
         )
         with st.container(border=True):
+            st.caption(f"**{block_a_name} — {_block_pct(state['a']):.1f}%**")
             block_a_parties = st.multiselect(
                 f"Partier i {block_a_name}", parties_selectable, default=state["a"], key="block_a_multiselect",
+                format_func=lambda code: chip_label(code, df_novus.loc[code, latest_col_cb]),
             )
         with st.container(border=True):
+            st.caption(f"**{block_b_name} — {_block_pct(state['b']):.1f}%**")
             block_b_parties = st.multiselect(
                 f"Partier i {block_b_name}", parties_selectable, default=state["b"], key="block_b_multiselect",
+                format_func=lambda code: chip_label(code, df_novus.loc[code, latest_col_cb]),
             )
         overlap = set(block_a_parties) & set(block_b_parties)
         if overlap:
@@ -874,7 +892,6 @@ with tab_custom:
                 "totalerna nedan räknar då med partiet dubbelt."
             )
 
-    latest_col_cb = timeline_cols[-1]
     a_pct = df_novus.loc[block_a_parties, latest_col_cb].sum() if block_a_parties else 0.0
     b_pct = df_novus.loc[block_b_parties, latest_col_cb].sum() if block_b_parties else 0.0
 
